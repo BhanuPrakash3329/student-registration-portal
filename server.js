@@ -428,12 +428,16 @@ app.put('/api/admin/student/:id', authenticate, requireAdmin, async (req, res) =
     const input = getStudentInput(req.body);
     if (input.error) return res.status(400).json({ error: input.error });
     try {
-        const [result] = await pool.execute(
+        const [students] = await pool.execute(
+            "SELECT id FROM users WHERE id = ? AND role = 'student' LIMIT 1",
+            [req.params.id]
+        );
+        if (!students[0]) return res.status(404).json({ error: 'Student not found.' });
+        await pool.execute(
             `UPDATE users SET dob=?, gender=?, qualification=?, interests=?, class_name=?, subject=?, marks=?
              WHERE id=? AND role='student'`,
             [...input.values.slice(1), req.params.id]
         );
-        if (!result.affectedRows) return res.status(404).json({ error: 'Student not found.' });
         res.json({ success: true, message: 'Student updated' });
     } catch (error) {
         console.error('Could not update student:', error.message);
