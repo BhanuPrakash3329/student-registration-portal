@@ -34,6 +34,10 @@ if (process.env.ADMIN_PASSWORD &&
     (process.env.ADMIN_PASSWORD.length < 12 || Buffer.byteLength(process.env.ADMIN_PASSWORD, 'utf8') > 72)) {
     throw new Error('ADMIN_PASSWORD must be at least 12 characters and no more than 72 UTF-8 bytes.');
 }
+if (process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD &&
+    process.env.ADMIN_EMAIL.trim().toLowerCase() === 'admin@admin.com') {
+    throw new Error('Choose a unique ADMIN_EMAIL; the old demo admin email is blocked.');
+}
 if (isProduction && (!process.env.APP_URL || !process.env.SMTP_HOST || !process.env.SMTP_FROM)) {
     throw new Error('Set APP_URL, SMTP_HOST, and SMTP_FROM for production password resets.');
 }
@@ -48,7 +52,11 @@ const pool = mysql.createPool({
     connectionLimit: 3,
     queueLimit: 0,
     dateStrings: true,
-    ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: true } : undefined
+    ssl: process.env.DB_SSL === 'true'
+        ? (process.env.DB_SSL_CA
+            ? { ca: Buffer.from(process.env.DB_SSL_CA, 'base64').toString('utf8'), rejectUnauthorized: true }
+            : { rejectUnauthorized: true })
+        : undefined
 });
 
 async function initializeDatabase() {

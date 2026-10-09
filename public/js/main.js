@@ -123,7 +123,7 @@ async function forgotPassword() {
             if (!response.ok) {
                 alert(result.error || 'Failed to start password reset.');
             } else if (result.resetUrl) {
-                alert(`Local development reset link (expires in 30 minutes):\n${result.resetUrl}`);
+                prompt('Local development reset link (expires in 30 minutes):', result.resetUrl);
             } else {
                 alert(result.message);
             }
