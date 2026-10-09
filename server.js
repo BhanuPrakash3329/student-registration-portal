@@ -21,8 +21,12 @@ const uploadDir = path.join(__dirname, 'uploads');
 if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
     throw new Error('Set JWT_SECRET to a random value with at least 32 characters.');
 }
-for (const variable of ['DB_HOST', 'DB_USER', 'DB_PASSWORD', 'DB_NAME']) {
+for (const variable of ['DB_HOST', 'DB_USER', 'DB_NAME']) {
     if (!process.env[variable]) throw new Error(`Set ${variable} in the environment.`);
+}
+if (!process.env.DB_PASSWORD &&
+    (isProduction || !['localhost', '127.0.0.1'].includes(process.env.DB_HOST))) {
+    throw new Error('Set DB_PASSWORD (blank passwords are only allowed for local development).');
 }
 if (isProduction && (!process.env.ADMIN_EMAIL || !process.env.ADMIN_PASSWORD)) {
     throw new Error('Set ADMIN_EMAIL and ADMIN_PASSWORD for the initial admin account.');

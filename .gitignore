@@ -8,6 +8,8 @@ database.db
 database.db-journal
 database.db-shm
 database.db-wal
+.mysql-data/
+.local-mysql-server.err
 
 # Uploaded documents may contain sensitive identity information.
 uploads/*
