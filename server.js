@@ -1,0 +1,612 @@
+require('dotenv').config();
+
+const express = require('express');
+const mysql = require('mysql2/promise');
+const multer = require('multer');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const cookieParser = require('cookie-parser');
+const nodemailer = require('nodemailer');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+const app = express();
+const isProduction = process.env.NODE_ENV === 'production';
+const PORT = Number(process.env.PORT) || 3000;
+const SESSION_COOKIE = 'student_portal_session';
+const MAX_PDF_SIZE = 3 * 1024 * 1024;
+const uploadDir = path.join(__dirname, 'uploads');
+
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+    throw new Error('Set JWT_SECRET to a random value with at least 32 characters.');
+}
+for (const variable of ['DB_HOST', 'DB_USER', 'DB_PASSWORD', 'DB_NAME']) {
+    if (!process.env[variable]) throw new Error(`Set ${variable} in the environment.`);
+}
+if (isProduction && (!process.env.ADMIN_EMAIL || !process.env.ADMIN_PASSWORD)) {
+    throw new Error('Set ADMIN_EMAIL and ADMIN_PASSWORD for the initial admin account.');
+}
+if (process.env.ADMIN_EMAIL && !process.env.ADMIN_PASSWORD) {
+    throw new Error('Set ADMIN_PASSWORD when ADMIN_EMAIL is configured.');
+}
+if (process.env.ADMIN_PASSWORD &&
+    (process.env.ADMIN_PASSWORD.length < 12 || Buffer.byteLength(process.env.ADMIN_PASSWORD, 'utf8') > 72)) {
+    throw new Error('ADMIN_PASSWORD must be at least 12 characters and no more than 72 UTF-8 bytes.');
+}
+if (isProduction && (!process.env.APP_URL || !process.env.SMTP_HOST || !process.env.SMTP_FROM)) {
+    throw new Error('Set APP_URL, SMTP_HOST, and SMTP_FROM for production password resets.');
+}
+
+const pool = mysql.createPool({
+    host: process.env.DB_HOST,
+    port: Number(process.env.DB_PORT) || 3306,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    waitForConnections: true,
+    connectionLimit: 3,
+    queueLimit: 0,
+    dateStrings: true,
+    ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: true } : undefined
+});
+
+async function initializeDatabase() {
+    const connection = await pool.getConnection();
+    try {
+        await connection.query(`CREATE TABLE IF NOT EXISTS users (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(150) NOT NULL,
+            email VARCHAR(254) NOT NULL UNIQUE,
+            password_hash VARCHAR(255) NOT NULL,
+            dob DATE NULL,
+            gender VARCHAR(30) NULL,
+            qualification VARCHAR(100) NULL,
+            interests TEXT NULL,
+            class_name VARCHAR(100) NULL,
+            subject VARCHAR(150) NULL,
+            marks INT NULL,
+            aadhar_filename VARCHAR(100) NULL,
+            aadhar_data MEDIUMBLOB NULL,
+            role ENUM('admin', 'student') NOT NULL DEFAULT 'student',
+            auth_version INT UNSIGNED NOT NULL DEFAULT 0,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+        await connection.query(`CREATE TABLE IF NOT EXISTS password_reset_tokens (
+            token_hash CHAR(64) NOT NULL PRIMARY KEY,
+            user_id BIGINT UNSIGNED NOT NULL,
+            expires_at DATETIME NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT fk_password_reset_user FOREIGN KEY (user_id)
+                REFERENCES users(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+        if (process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD) {
+            const email = process.env.ADMIN_EMAIL.trim().toLowerCase();
+            const [existing] = await connection.execute(
+                'SELECT id FROM users WHERE email = ? LIMIT 1', [email]
+            );
+            if (existing.length === 0) {
+                const passwordHash = await bcrypt.hash(process.env.ADMIN_PASSWORD, 12);
+                try {
+                    await connection.execute(
+                        'INSERT INTO users (name, email, password_hash, role) VALUES (?, ?, ?, ?)',
+                        ['Admin', email, passwordHash, 'admin']
+                    );
+                } catch (error) {
+                    // Another serverless instance may have seeded this account concurrently.
+                    if (error.code !== 'ER_DUP_ENTRY') throw error;
+                }
+            }
+        }
+    } finally {
+        connection.release();
+    }
+}
+
+const databaseReady = initializeDatabase();
+databaseReady.catch(() => {});
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: MAX_PDF_SIZE, files: 1 },
+    fileFilter: (req, file, callback) => {
+        const isPdf = file.mimetype === 'application/pdf' &&
+            path.extname(file.originalname).toLowerCase() === '.pdf';
+        if (!isPdf) {
+            const error = new Error('Only PDF files are allowed!');
+            error.status = 400;
+            return callback(error);
+        }
+        callback(null, true);
+    }
+});
+
+const mailer = process.env.SMTP_HOST && process.env.SMTP_FROM
+    ? nodemailer.createTransport({
+        host: process.env.SMTP_HOST,
+        port: Number(process.env.SMTP_PORT) || 587,
+        secure: process.env.SMTP_SECURE === 'true',
+        auth: process.env.SMTP_USER ? {
+            user: process.env.SMTP_USER,
+            pass: process.env.SMTP_PASSWORD
+        } : undefined
+    })
+    : null;
+
+app.use(express.json({ limit: '100kb' }));
+app.use(express.urlencoded({ extended: true, limit: '100kb' }));
+app.use(cookieParser());
+app.use(async (req, res, next) => {
+    try {
+        await databaseReady;
+        next();
+    } catch (error) {
+        console.error('Database is unavailable:', error.message);
+        res.status(503).json({ error: 'Database is temporarily unavailable.' });
+    }
+});
+
+function setSessionCookie(res, token) {
+    res.cookie(SESSION_COOKIE, token, {
+        httpOnly: true,
+        secure: isProduction,
+        sameSite: 'strict',
+        path: '/',
+        maxAge: 12 * 60 * 60 * 1000
+    });
+}
+
+function clearSessionCookie(res) {
+    res.clearCookie(SESSION_COOKIE, {
+        httpOnly: true,
+        secure: isProduction,
+        sameSite: 'strict',
+        path: '/'
+    });
+}
+
+async function authenticate(req, res, next) {
+    const token = req.cookies[SESSION_COOKIE];
+    if (!token) {
+        return req.accepts('html') && req.path.endsWith('.html')
+            ? res.redirect('/login.html')
+            : res.status(401).json({ error: 'Please log in.' });
+    }
+
+    try {
+        const claims = jwt.verify(token, process.env.JWT_SECRET);
+        const [rows] = await pool.execute(
+            'SELECT id, email, role, auth_version FROM users WHERE id = ? LIMIT 1',
+            [claims.sub]
+        );
+        const account = rows[0];
+        if (!account || account.auth_version !== claims.ver) {
+            clearSessionCookie(res);
+            if (req.accepts('html') && req.path.endsWith('.html')) return res.redirect('/login.html');
+            return res.status(401).json({ error: 'Please log in again.' });
+        }
+        req.user = { id: account.id, email: account.email, role: account.role };
+        next();
+    } catch (error) {
+        clearSessionCookie(res);
+        if (req.accepts('html') && req.path.endsWith('.html')) return res.redirect('/login.html');
+        return res.status(401).json({ error: 'Please log in again.' });
+    }
+}
+
+function requireAdmin(req, res, next) {
+    if (req.user.role !== 'admin') {
+        if (req.accepts('html') && req.path.endsWith('.html')) return res.redirect('/student.html');
+        return res.status(403).json({ error: 'Admin access required.' });
+    }
+    next();
+}
+
+function requireAccountOrAdmin(req, res, next) {
+    const requestedId = String(req.params.id);
+    if (req.user.role !== 'admin' && String(req.user.id) !== requestedId) {
+        return res.status(403).json({ error: 'You may only access your own account.' });
+    }
+    next();
+}
+
+app.get('/admin.html', authenticate, requireAdmin, (req, res) => {
+    res.sendFile(path.join(__dirname, 'views', 'admin.html'));
+});
+app.get('/student.html', authenticate, (req, res) => {
+    if (req.user.role !== 'student') return res.redirect('/login.html');
+    res.sendFile(path.join(__dirname, 'views', 'student.html'));
+});
+
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.use('/api', (req, res, next) => {
+    if (isProduction && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+        const origin = req.get('origin');
+        if (origin && new URL(origin).host !== req.get('host')) {
+            return res.status(403).json({ error: 'Cross-origin request rejected.' });
+        }
+    }
+    next();
+});
+
+function validPdf(file) {
+    return file && file.buffer.length >= 5 && file.buffer.subarray(0, 5).toString() === '%PDF-';
+}
+
+async function persistLocalPdf(filename, buffer) {
+    if (!isProduction) {
+        await fs.promises.mkdir(uploadDir, { recursive: true });
+        await fs.promises.writeFile(path.join(uploadDir, filename), buffer, { flag: 'wx' });
+    }
+}
+
+async function removeLocalPdf(filename) {
+    if (isProduction || !filename) return;
+    try {
+        await fs.promises.unlink(path.join(uploadDir, filename));
+    } catch (error) {
+        if (error.code !== 'ENOENT') console.error('Could not remove local PDF:', error.message);
+    }
+}
+
+function publicUser(row) {
+    return {
+        id: row.id,
+        name: row.name,
+        email: row.email,
+        dob: row.dob,
+        gender: row.gender,
+        qualification: row.qualification,
+        interests: row.interests,
+        class: row.class_name,
+        subject: row.subject,
+        marks: row.marks,
+        has_aadhar: Boolean(row.aadhar_filename),
+        role: row.role
+    };
+}
+
+function getStudentFields() {
+    return `id, name, email, dob, gender, qualification, interests,
+            class_name, subject, marks, aadhar_filename, role`;
+}
+
+function getStudentInput(body) {
+    const marks = body.marks === '' || body.marks == null ? null : Number(body.marks);
+    if (marks !== null && (!Number.isInteger(marks) || marks < 0)) {
+        return { error: 'Marks must be a non-negative whole number.' };
+    }
+    return {
+        values: [
+            String(body.name || '').trim(),
+            body.dob || null,
+            body.gender || null,
+            body.qualification || null,
+            body.interests || null,
+            String(body.class || '').trim() || null,
+            String(body.subject || '').trim() || null,
+            marks
+        ]
+    };
+}
+
+app.post('/api/signup', upload.single('aadhar'), async (req, res) => {
+    const { name, email, password, dob, gender, qualification, interests, class: studentClass, subject, marks } = req.body;
+    if (!req.file || !validPdf(req.file)) {
+        return res.status(400).json({ error: 'A valid Aadhaar PDF document is required.' });
+    }
+    if (!name || !email || !password || !dob || !gender || !qualification ||
+        !studentClass || !subject || marks === undefined || marks === '') {
+        return res.status(400).json({ error: 'Please complete all required fields.' });
+    }
+    if (password.length < 10 || Buffer.byteLength(password, 'utf8') > 72) {
+        return res.status(400).json({ error: 'Password must be 10 or more characters (maximum 72 UTF-8 bytes).' });
+    }
+
+    const input = getStudentInput({ name, dob, gender, qualification, interests, class: studentClass, subject, marks });
+    if (input.error) return res.status(400).json({ error: input.error });
+    let savedFilename;
+    try {
+        const emailAddress = String(email).trim().toLowerCase();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailAddress)) {
+            return res.status(400).json({ error: 'Enter a valid email address.' });
+        }
+        const passwordHash = await bcrypt.hash(password, 12);
+        savedFilename = `aadhar-${crypto.randomUUID()}.pdf`;
+        await persistLocalPdf(savedFilename, req.file.buffer);
+        const [result] = await pool.execute(
+            `INSERT INTO users
+             (name, email, password_hash, dob, gender, qualification, interests, class_name, subject, marks, aadhar_filename, aadhar_data)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [input.values[0], emailAddress, passwordHash, ...input.values.slice(1), savedFilename, req.file.buffer]
+        );
+        res.status(201).json({ success: true, message: 'Registration successful', userId: result.insertId });
+    } catch (error) {
+        await removeLocalPdf(savedFilename);
+        if (error.code === 'ER_DUP_ENTRY') {
+            return res.status(400).json({ error: 'This email is already registered.' });
+        }
+        console.error('Signup failed:', error.message);
+        res.status(500).json({ error: 'Could not complete registration.' });
+    }
+});
+
+app.post('/api/login', async (req, res) => {
+    try {
+        const email = String(req.body.email || '').trim().toLowerCase();
+        const [rows] = await pool.execute(
+            'SELECT id, email, password_hash, role, auth_version FROM users WHERE email = ? LIMIT 1',
+            [email]
+        );
+        const account = rows[0];
+        if (!account || !(await bcrypt.compare(req.body.password || '', account.password_hash))) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+
+        const token = jwt.sign(
+            { ver: account.auth_version },
+            process.env.JWT_SECRET,
+            { subject: String(account.id), expiresIn: '12h', issuer: 'student-registration-portal' }
+        );
+        setSessionCookie(res, token);
+        res.json({ success: true, user: { id: account.id, email: account.email, role: account.role } });
+    } catch (error) {
+        console.error('Login failed:', error.message);
+        res.status(500).json({ error: 'Could not log in.' });
+    }
+});
+
+app.post('/api/logout', authenticate, async (req, res) => {
+    try {
+        await pool.execute('UPDATE users SET auth_version = auth_version + 1 WHERE id = ?', [req.user.id]);
+        clearSessionCookie(res);
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Logout failed:', error.message);
+        res.status(500).json({ error: 'Could not log out.' });
+    }
+});
+
+app.get('/api/me', authenticate, async (req, res) => {
+    try {
+        if (req.user.role === 'admin') {
+            return res.json({ id: req.user.id, email: req.user.email, role: req.user.role });
+        }
+        const [rows] = await pool.execute(
+            `SELECT ${getStudentFields()} FROM users WHERE id = ? AND role = 'student' LIMIT 1`,
+            [req.user.id]
+        );
+        if (!rows[0]) return res.status(404).json({ error: 'User not found.' });
+        res.json(publicUser(rows[0]));
+    } catch (error) {
+        console.error('Could not load current account:', error.message);
+        res.status(500).json({ error: 'Could not load account.' });
+    }
+});
+
+app.get('/api/admin/students', authenticate, requireAdmin, async (req, res) => {
+    try {
+        const [rows] = await pool.query(
+            `SELECT ${getStudentFields()} FROM users WHERE role = 'student' ORDER BY id DESC`
+        );
+        res.json(rows.map(publicUser));
+    } catch (error) {
+        console.error('Could not list students:', error.message);
+        res.status(500).json({ error: 'Could not load students.' });
+    }
+});
+
+app.delete('/api/admin/student/:id', authenticate, requireAdmin, async (req, res) => {
+    try {
+        const [students] = await pool.execute(
+            "SELECT aadhar_filename FROM users WHERE id = ? AND role = 'student' LIMIT 1",
+            [req.params.id]
+        );
+        if (!students[0]) return res.status(404).json({ error: 'Student not found.' });
+        const [result] = await pool.execute(
+            "DELETE FROM users WHERE id = ? AND role = 'student'", [req.params.id]
+        );
+        if (!result.affectedRows) return res.status(404).json({ error: 'Student not found.' });
+        await removeLocalPdf(students[0].aadhar_filename);
+        res.json({ success: true, message: 'Student deleted' });
+    } catch (error) {
+        console.error('Could not delete student:', error.message);
+        res.status(500).json({ error: 'Could not delete student.' });
+    }
+});
+
+app.put('/api/admin/student/:id', authenticate, requireAdmin, async (req, res) => {
+    const input = getStudentInput(req.body);
+    if (input.error) return res.status(400).json({ error: input.error });
+    try {
+        const [result] = await pool.execute(
+            `UPDATE users SET dob=?, gender=?, qualification=?, interests=?, class_name=?, subject=?, marks=?
+             WHERE id=? AND role='student'`,
+            [...input.values.slice(1), req.params.id]
+        );
+        if (!result.affectedRows) return res.status(404).json({ error: 'Student not found.' });
+        res.json({ success: true, message: 'Student updated' });
+    } catch (error) {
+        console.error('Could not update student:', error.message);
+        res.status(500).json({ error: 'Could not update student.' });
+    }
+});
+
+app.get('/api/student/:id', authenticate, requireAccountOrAdmin, async (req, res) => {
+    try {
+        const [rows] = await pool.execute(
+            `SELECT ${getStudentFields()} FROM users WHERE id = ? AND role = 'student' LIMIT 1`,
+            [req.params.id]
+        );
+        if (!rows[0]) return res.status(404).json({ error: 'User not found' });
+        res.json(publicUser(rows[0]));
+    } catch (error) {
+        console.error('Could not load student:', error.message);
+        res.status(500).json({ error: 'Could not load student.' });
+    }
+});
+
+app.put('/api/student/:id', authenticate, requireAccountOrAdmin, upload.single('aadhar'), async (req, res) => {
+    if (req.user.role !== 'student') {
+        return res.status(403).json({ error: 'Only students can update their profiles.' });
+    }
+    if (req.file && !validPdf(req.file)) {
+        return res.status(400).json({ error: 'Please upload a valid PDF file.' });
+    }
+    if (!String(req.body.name || '').trim()) {
+        return res.status(400).json({ error: 'Name is required.' });
+    }
+    const input = getStudentInput(req.body);
+    if (input.error) return res.status(400).json({ error: input.error });
+    let replacementFilename;
+    try {
+        const [existingRows] = await pool.execute(
+            "SELECT aadhar_filename FROM users WHERE id = ? AND role = 'student' LIMIT 1",
+            [req.params.id]
+        );
+        if (!existingRows[0]) return res.status(404).json({ error: 'User not found' });
+
+        let sql = `UPDATE users SET name=?, dob=?, gender=?, qualification=?, interests=?, class_name=?, subject=?, marks=?`;
+        const values = input.values;
+        if (req.file) {
+            replacementFilename = `aadhar-${crypto.randomUUID()}.pdf`;
+            await persistLocalPdf(replacementFilename, req.file.buffer);
+            sql += ', aadhar_filename=?, aadhar_data=?';
+            values.push(replacementFilename, req.file.buffer);
+        }
+        sql += " WHERE id=? AND role='student'";
+        values.push(req.params.id);
+        await pool.execute(sql, values);
+        if (replacementFilename) await removeLocalPdf(existingRows[0].aadhar_filename);
+        res.json({ success: true, message: 'Profile updated' });
+    } catch (error) {
+        await removeLocalPdf(replacementFilename);
+        console.error('Could not update profile:', error.message);
+        res.status(500).json({ error: 'Could not update profile.' });
+    }
+});
+
+async function serveAadhar(req, res, next) {
+    try {
+        const [rows] = await pool.execute(
+            "SELECT aadhar_filename, aadhar_data FROM users WHERE id = ? AND role = 'student' LIMIT 1",
+            [req.params.id]
+        );
+        if (!rows[0] || !rows[0].aadhar_data) return res.status(404).json({ error: 'PDF not found.' });
+        res.set({
+            'Content-Type': 'application/pdf',
+            'Content-Disposition': `inline; filename="${rows[0].aadhar_filename}"`,
+            'Cache-Control': 'private, no-store',
+            'X-Content-Type-Options': 'nosniff'
+        });
+        res.send(rows[0].aadhar_data);
+    } catch (error) {
+        next(error);
+    }
+}
+
+app.get('/api/student/:id/aadhar', authenticate, requireAccountOrAdmin, serveAadhar);
+app.get('/api/admin/student/:id/aadhar', authenticate, requireAdmin, serveAadhar);
+
+app.post('/api/forgot-password', async (req, res) => {
+    const email = String(req.body.email || '').trim().toLowerCase();
+    if (!email) return res.status(400).json({ error: 'Email is required.' });
+    if (!mailer && isProduction) {
+        return res.status(503).json({ error: 'Password reset email is not configured.' });
+    }
+    try {
+        const [rows] = await pool.execute('SELECT id FROM users WHERE email = ? LIMIT 1', [email]);
+        if (rows[0]) {
+            const rawToken = crypto.randomBytes(32).toString('hex');
+            const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+            await pool.execute('DELETE FROM password_reset_tokens WHERE user_id = ?', [rows[0].id]);
+            await pool.execute(
+                'INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES (?, ?, DATE_ADD(UTC_TIMESTAMP(), INTERVAL 30 MINUTE))',
+                [tokenHash, rows[0].id]
+            );
+            const baseUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
+            const resetUrl = new URL('/reset-password.html', baseUrl);
+            resetUrl.searchParams.set('token', rawToken);
+            if (mailer) {
+                await mailer.sendMail({
+                    from: process.env.SMTP_FROM,
+                    to: email,
+                    subject: 'Reset your student portal password',
+                    text: `Use this link within 30 minutes to reset your password: ${resetUrl}`
+                });
+            } else {
+                // Local-only convenience; production always requires configured email delivery.
+                return res.json({ success: true, message: 'Password reset link created.', resetUrl: resetUrl.toString() });
+            }
+        }
+        res.json({ success: true, message: 'If the account exists, a password reset link has been sent.' });
+    } catch (error) {
+        console.error('Could not create password reset:', error.message);
+        res.status(500).json({ error: 'Could not start password reset.' });
+    }
+});
+
+app.post('/api/reset-password', async (req, res) => {
+    const { token, newPassword } = req.body;
+    if (typeof token !== 'string' || typeof newPassword !== 'string' || newPassword.length < 10 ||
+        Buffer.byteLength(newPassword, 'utf8') > 72) {
+        return res.status(400).json({ error: 'Use a valid reset link and a password of 10 to 72 UTF-8 bytes.' });
+    }
+    try {
+        const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+        const connection = await pool.getConnection();
+        try {
+            await connection.beginTransaction();
+            const [rows] = await connection.execute(
+                'SELECT user_id FROM password_reset_tokens WHERE token_hash = ? AND expires_at > UTC_TIMESTAMP() FOR UPDATE',
+                [tokenHash]
+            );
+            if (!rows[0]) {
+                await connection.rollback();
+                return res.status(400).json({ error: 'This reset link is invalid or expired.' });
+            }
+            const passwordHash = await bcrypt.hash(newPassword, 12);
+            await connection.execute(
+                'UPDATE users SET password_hash = ?, auth_version = auth_version + 1 WHERE id = ?',
+                [passwordHash, rows[0].user_id]
+            );
+            await connection.execute('DELETE FROM password_reset_tokens WHERE user_id = ?', [rows[0].user_id]);
+            await connection.commit();
+            clearSessionCookie(res);
+            res.json({ success: true, message: 'Password reset. Please log in with your new password.' });
+        } catch (error) {
+            await connection.rollback();
+            throw error;
+        } finally {
+            connection.release();
+        }
+    } catch (error) {
+        console.error('Could not reset password:', error.message);
+        res.status(500).json({ error: 'Could not reset password.' });
+    }
+});
+
+app.use((err, req, res, next) => {
+    if (res.headersSent) return next(err);
+    if (err instanceof multer.MulterError) {
+        const message = err.code === 'LIMIT_FILE_SIZE'
+            ? 'PDF must be 3 MB or smaller.'
+            : err.message;
+        return res.status(400).json({ error: message });
+    }
+    if (err && err.status >= 400 && err.status < 500) {
+        return res.status(err.status).json({ error: err.message || 'Invalid request.' });
+    }
+    if (err) {
+        console.error('Unhandled request error:', err.message);
+        return res.status(500).json({ error: 'Internal server error.' });
+    }
+    next();
+});
+
+if (require.main === module) {
+    app.listen(PORT, () => console.log(`Server is running on http://localhost:${PORT}`));
+}
+
+module.exports = app;

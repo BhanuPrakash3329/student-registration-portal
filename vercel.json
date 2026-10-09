@@ -1,0 +1,8 @@
+{
+  "functions": {
+    "server.js": {
+      "maxDuration": 30,
+      "includeFiles": "views/**"
+    }
+  }
+}
