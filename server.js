@@ -1,7 +1,7 @@
 require('dotenv').config();
 
 const express = require('express');
-const mysql = require('mysql2/promise');
+const { Pool } = require('pg');
 const multer = require('multer');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -18,15 +18,9 @@ const SESSION_COOKIE = 'student_portal_session';
 const MAX_PDF_SIZE = 3 * 1024 * 1024;
 const uploadDir = path.join(__dirname, 'uploads');
 
+if (!process.env.DATABASE_URL) throw new Error('Set DATABASE_URL to the Neon PostgreSQL connection string.');
 if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
     throw new Error('Set JWT_SECRET to a random value with at least 32 characters.');
-}
-for (const variable of ['DB_HOST', 'DB_USER', 'DB_NAME']) {
-    if (!process.env[variable]) throw new Error(`Set ${variable} in the environment.`);
-}
-if (!process.env.DB_PASSWORD &&
-    (isProduction || !['localhost', '127.0.0.1'].includes(process.env.DB_HOST))) {
-    throw new Error('Set DB_PASSWORD (blank passwords are only allowed for local development).');
 }
 if (isProduction && (!process.env.ADMIN_EMAIL || !process.env.ADMIN_PASSWORD)) {
     throw new Error('Set ADMIN_EMAIL and ADMIN_PASSWORD for the initial admin account.');
@@ -42,82 +36,55 @@ if (process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD &&
     process.env.ADMIN_EMAIL.trim().toLowerCase() === 'admin@admin.com') {
     throw new Error('Choose a unique ADMIN_EMAIL; the old demo admin email is blocked.');
 }
-if (isProduction && (!process.env.APP_URL || !process.env.SMTP_HOST || !process.env.SMTP_FROM)) {
-    throw new Error('Set APP_URL, SMTP_HOST, and SMTP_FROM for production password resets.');
-}
+if (isProduction && !process.env.APP_URL) throw new Error('Set APP_URL to the deployed HTTPS origin.');
 
-const pool = mysql.createPool({
-    host: process.env.DB_HOST,
-    port: Number(process.env.DB_PORT) || 3306,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME,
-    waitForConnections: true,
-    connectionLimit: 3,
-    queueLimit: 0,
-    dateStrings: true,
-    ssl: process.env.DB_SSL === 'true'
-        ? (process.env.DB_SSL_CA
-            ? { ca: Buffer.from(process.env.DB_SSL_CA, 'base64').toString('utf8'), rejectUnauthorized: true }
-            : { rejectUnauthorized: true })
-        : undefined
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    max: 3,
+    idleTimeoutMillis: 10000,
+    connectionTimeoutMillis: 10000
 });
 
 async function initializeDatabase() {
-    const connection = await pool.getConnection();
-    try {
-        await connection.query(`CREATE TABLE IF NOT EXISTS users (
-            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-            name VARCHAR(150) NOT NULL,
-            email VARCHAR(254) NOT NULL UNIQUE,
-            password_hash VARCHAR(255) NOT NULL,
-            dob DATE NULL,
-            gender VARCHAR(30) NULL,
-            qualification VARCHAR(100) NULL,
-            interests TEXT NULL,
-            class_name VARCHAR(100) NULL,
-            subject VARCHAR(150) NULL,
-            marks INT NULL,
-            aadhar_filename VARCHAR(100) NULL,
-            aadhar_data MEDIUMBLOB NULL,
-            role ENUM('admin', 'student') NOT NULL DEFAULT 'student',
-            auth_version INT UNSIGNED NOT NULL DEFAULT 0,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
-        await connection.query(`CREATE TABLE IF NOT EXISTS password_reset_tokens (
-            token_hash CHAR(64) NOT NULL PRIMARY KEY,
-            user_id BIGINT UNSIGNED NOT NULL,
-            expires_at DATETIME NOT NULL,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            CONSTRAINT fk_password_reset_user FOREIGN KEY (user_id)
-                REFERENCES users(id) ON DELETE CASCADE
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS users (
+        id BIGSERIAL PRIMARY KEY,
+        name VARCHAR(150) NOT NULL,
+        email VARCHAR(254) NOT NULL UNIQUE,
+        password_hash VARCHAR(255) NOT NULL,
+        dob DATE,
+        gender VARCHAR(30),
+        qualification VARCHAR(100),
+        interests TEXT,
+        class_name VARCHAR(100),
+        subject VARCHAR(150),
+        marks INTEGER,
+        aadhar_filename VARCHAR(100),
+        aadhar_data BYTEA,
+        role VARCHAR(10) NOT NULL DEFAULT 'student' CHECK (role IN ('admin', 'student')),
+        auth_version INTEGER NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS password_reset_tokens (
+        token_hash CHAR(64) PRIMARY KEY,
+        user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`);
 
-        if (process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD) {
-            const email = process.env.ADMIN_EMAIL.trim().toLowerCase();
-            const [existing] = await connection.execute(
-                'SELECT id FROM users WHERE email = ? LIMIT 1', [email]
-            );
-            if (existing.length === 0) {
-                const passwordHash = await bcrypt.hash(process.env.ADMIN_PASSWORD, 12);
-                try {
-                    await connection.execute(
-                        'INSERT INTO users (name, email, password_hash, role) VALUES (?, ?, ?, ?)',
-                        ['Admin', email, passwordHash, 'admin']
-                    );
-                } catch (error) {
-                    // Another serverless instance may have seeded this account concurrently.
-                    if (error.code !== 'ER_DUP_ENTRY') throw error;
-                }
-            }
-        }
-    } finally {
-        connection.release();
+    if (process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD) {
+        const email = process.env.ADMIN_EMAIL.trim().toLowerCase();
+        const passwordHash = await bcrypt.hash(process.env.ADMIN_PASSWORD, 12);
+        await pool.query(
+            `INSERT INTO users (name, email, password_hash, role)
+             VALUES ('Admin', $1, $2, 'admin') ON CONFLICT (email) DO NOTHING`,
+            [email, passwordHash]
+        );
     }
 }
 
 const databaseReady = initializeDatabase();
 databaseReady.catch(() => {});
+
 const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: MAX_PDF_SIZE, files: 1 },
@@ -184,11 +151,10 @@ async function authenticate(req, res, next) {
             ? res.redirect('/login.html')
             : res.status(401).json({ error: 'Please log in.' });
     }
-
     try {
         const claims = jwt.verify(token, process.env.JWT_SECRET);
-        const [rows] = await pool.execute(
-            'SELECT id, email, role, auth_version FROM users WHERE id = ? LIMIT 1',
+        const { rows } = await pool.query(
+            'SELECT id, email, role, auth_version FROM users WHERE id = $1 LIMIT 1',
             [claims.sub]
         );
         const account = rows[0];
@@ -215,8 +181,7 @@ function requireAdmin(req, res, next) {
 }
 
 function requireAccountOrAdmin(req, res, next) {
-    const requestedId = String(req.params.id);
-    if (req.user.role !== 'admin' && String(req.user.id) !== requestedId) {
+    if (req.user.role !== 'admin' && String(req.user.id) !== String(req.params.id)) {
         return res.status(403).json({ error: 'You may only access your own account.' });
     }
     next();
@@ -229,7 +194,6 @@ app.get('/student.html', authenticate, (req, res) => {
     if (req.user.role !== 'student') return res.redirect('/login.html');
     res.sendFile(path.join(__dirname, 'views', 'student.html'));
 });
-
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.use('/api', (req, res, next) => {
@@ -279,10 +243,8 @@ function publicUser(row) {
     };
 }
 
-function getStudentFields() {
-    return `id, name, email, dob, gender, qualification, interests,
-            class_name, subject, marks, aadhar_filename, role`;
-}
+const studentFields = `id, name, email, dob::text AS dob, gender, qualification,
+    interests, class_name, subject, marks, aadhar_filename, role`;
 
 function getStudentInput(body) {
     const marks = body.marks === '' || body.marks == null ? null : Number(body.marks);
@@ -315,7 +277,6 @@ app.post('/api/signup', upload.single('aadhar'), async (req, res) => {
     if (password.length < 10 || Buffer.byteLength(password, 'utf8') > 72) {
         return res.status(400).json({ error: 'Password must be 10 or more characters (maximum 72 UTF-8 bytes).' });
     }
-
     const input = getStudentInput({ name, dob, gender, qualification, interests, class: studentClass, subject, marks });
     if (input.error) return res.status(400).json({ error: input.error });
     let savedFilename;
@@ -327,18 +288,17 @@ app.post('/api/signup', upload.single('aadhar'), async (req, res) => {
         const passwordHash = await bcrypt.hash(password, 12);
         savedFilename = `aadhar-${crypto.randomUUID()}.pdf`;
         await persistLocalPdf(savedFilename, req.file.buffer);
-        const [result] = await pool.execute(
+        const { rows } = await pool.query(
             `INSERT INTO users
              (name, email, password_hash, dob, gender, qualification, interests, class_name, subject, marks, aadhar_filename, aadhar_data)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+             RETURNING id`,
             [input.values[0], emailAddress, passwordHash, ...input.values.slice(1), savedFilename, req.file.buffer]
         );
-        res.status(201).json({ success: true, message: 'Registration successful', userId: result.insertId });
+        res.status(201).json({ success: true, message: 'Registration successful', userId: rows[0].id });
     } catch (error) {
         await removeLocalPdf(savedFilename);
-        if (error.code === 'ER_DUP_ENTRY') {
-            return res.status(400).json({ error: 'This email is already registered.' });
-        }
+        if (error.code === '23505') return res.status(400).json({ error: 'This email is already registered.' });
         console.error('Signup failed:', error.message);
         res.status(500).json({ error: 'Could not complete registration.' });
     }
@@ -347,15 +307,14 @@ app.post('/api/signup', upload.single('aadhar'), async (req, res) => {
 app.post('/api/login', async (req, res) => {
     try {
         const email = String(req.body.email || '').trim().toLowerCase();
-        const [rows] = await pool.execute(
-            'SELECT id, email, password_hash, role, auth_version FROM users WHERE email = ? LIMIT 1',
+        const { rows } = await pool.query(
+            'SELECT id, email, password_hash, role, auth_version FROM users WHERE email = $1 LIMIT 1',
             [email]
         );
         const account = rows[0];
         if (!account || !(await bcrypt.compare(req.body.password || '', account.password_hash))) {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
-
         const token = jwt.sign(
             { ver: account.auth_version },
             process.env.JWT_SECRET,
@@ -371,7 +330,7 @@ app.post('/api/login', async (req, res) => {
 
 app.post('/api/logout', authenticate, async (req, res) => {
     try {
-        await pool.execute('UPDATE users SET auth_version = auth_version + 1 WHERE id = ?', [req.user.id]);
+        await pool.query('UPDATE users SET auth_version = auth_version + 1 WHERE id = $1', [req.user.id]);
         clearSessionCookie(res);
         res.json({ success: true });
     } catch (error) {
@@ -385,8 +344,8 @@ app.get('/api/me', authenticate, async (req, res) => {
         if (req.user.role === 'admin') {
             return res.json({ id: req.user.id, email: req.user.email, role: req.user.role });
         }
-        const [rows] = await pool.execute(
-            `SELECT ${getStudentFields()} FROM users WHERE id = ? AND role = 'student' LIMIT 1`,
+        const { rows } = await pool.query(
+            `SELECT ${studentFields} FROM users WHERE id = $1 AND role = 'student' LIMIT 1`,
             [req.user.id]
         );
         if (!rows[0]) return res.status(404).json({ error: 'User not found.' });
@@ -399,9 +358,7 @@ app.get('/api/me', authenticate, async (req, res) => {
 
 app.get('/api/admin/students', authenticate, requireAdmin, async (req, res) => {
     try {
-        const [rows] = await pool.query(
-            `SELECT ${getStudentFields()} FROM users WHERE role = 'student' ORDER BY id DESC`
-        );
+        const { rows } = await pool.query(`SELECT ${studentFields} FROM users WHERE role = 'student' ORDER BY id DESC`);
         res.json(rows.map(publicUser));
     } catch (error) {
         console.error('Could not list students:', error.message);
@@ -411,16 +368,13 @@ app.get('/api/admin/students', authenticate, requireAdmin, async (req, res) => {
 
 app.delete('/api/admin/student/:id', authenticate, requireAdmin, async (req, res) => {
     try {
-        const [students] = await pool.execute(
-            "SELECT aadhar_filename FROM users WHERE id = ? AND role = 'student' LIMIT 1",
+        const { rows } = await pool.query(
+            "SELECT aadhar_filename FROM users WHERE id = $1 AND role = 'student' LIMIT 1",
             [req.params.id]
         );
-        if (!students[0]) return res.status(404).json({ error: 'Student not found.' });
-        const [result] = await pool.execute(
-            "DELETE FROM users WHERE id = ? AND role = 'student'", [req.params.id]
-        );
-        if (!result.affectedRows) return res.status(404).json({ error: 'Student not found.' });
-        await removeLocalPdf(students[0].aadhar_filename);
+        if (!rows[0]) return res.status(404).json({ error: 'Student not found.' });
+        await pool.query("DELETE FROM users WHERE id = $1 AND role = 'student'", [req.params.id]);
+        await removeLocalPdf(rows[0].aadhar_filename);
         res.json({ success: true, message: 'Student deleted' });
     } catch (error) {
         console.error('Could not delete student:', error.message);
@@ -432,14 +386,13 @@ app.put('/api/admin/student/:id', authenticate, requireAdmin, async (req, res) =
     const input = getStudentInput(req.body);
     if (input.error) return res.status(400).json({ error: input.error });
     try {
-        const [students] = await pool.execute(
-            "SELECT id FROM users WHERE id = ? AND role = 'student' LIMIT 1",
-            [req.params.id]
+        const { rows } = await pool.query(
+            "SELECT id FROM users WHERE id = $1 AND role = 'student' LIMIT 1", [req.params.id]
         );
-        if (!students[0]) return res.status(404).json({ error: 'Student not found.' });
-        await pool.execute(
-            `UPDATE users SET dob=?, gender=?, qualification=?, interests=?, class_name=?, subject=?, marks=?
-             WHERE id=? AND role='student'`,
+        if (!rows[0]) return res.status(404).json({ error: 'Student not found.' });
+        await pool.query(
+            `UPDATE users SET dob=$1, gender=$2, qualification=$3, interests=$4,
+             class_name=$5, subject=$6, marks=$7 WHERE id=$8 AND role='student'`,
             [...input.values.slice(1), req.params.id]
         );
         res.json({ success: true, message: 'Student updated' });
@@ -451,9 +404,8 @@ app.put('/api/admin/student/:id', authenticate, requireAdmin, async (req, res) =
 
 app.get('/api/student/:id', authenticate, requireAccountOrAdmin, async (req, res) => {
     try {
-        const [rows] = await pool.execute(
-            `SELECT ${getStudentFields()} FROM users WHERE id = ? AND role = 'student' LIMIT 1`,
-            [req.params.id]
+        const { rows } = await pool.query(
+            `SELECT ${studentFields} FROM users WHERE id=$1 AND role='student' LIMIT 1`, [req.params.id]
         );
         if (!rows[0]) return res.status(404).json({ error: 'User not found' });
         res.json(publicUser(rows[0]));
@@ -464,37 +416,31 @@ app.get('/api/student/:id', authenticate, requireAccountOrAdmin, async (req, res
 });
 
 app.put('/api/student/:id', authenticate, requireAccountOrAdmin, upload.single('aadhar'), async (req, res) => {
-    if (req.user.role !== 'student') {
-        return res.status(403).json({ error: 'Only students can update their profiles.' });
-    }
-    if (req.file && !validPdf(req.file)) {
-        return res.status(400).json({ error: 'Please upload a valid PDF file.' });
-    }
-    if (!String(req.body.name || '').trim()) {
-        return res.status(400).json({ error: 'Name is required.' });
-    }
+    if (req.user.role !== 'student') return res.status(403).json({ error: 'Only students can update their profiles.' });
+    if (req.file && !validPdf(req.file)) return res.status(400).json({ error: 'Please upload a valid PDF file.' });
+    if (!String(req.body.name || '').trim()) return res.status(400).json({ error: 'Name is required.' });
     const input = getStudentInput(req.body);
     if (input.error) return res.status(400).json({ error: input.error });
     let replacementFilename;
     try {
-        const [existingRows] = await pool.execute(
-            "SELECT aadhar_filename FROM users WHERE id = ? AND role = 'student' LIMIT 1",
-            [req.params.id]
+        const { rows } = await pool.query(
+            "SELECT aadhar_filename FROM users WHERE id=$1 AND role='student' LIMIT 1", [req.params.id]
         );
-        if (!existingRows[0]) return res.status(404).json({ error: 'User not found' });
-
-        let sql = `UPDATE users SET name=?, dob=?, gender=?, qualification=?, interests=?, class_name=?, subject=?, marks=?`;
+        if (!rows[0]) return res.status(404).json({ error: 'User not found' });
+        let sql = `UPDATE users SET name=$1, dob=$2, gender=$3, qualification=$4,
+            interests=$5, class_name=$6, subject=$7, marks=$8`;
         const values = input.values;
         if (req.file) {
             replacementFilename = `aadhar-${crypto.randomUUID()}.pdf`;
             await persistLocalPdf(replacementFilename, req.file.buffer);
-            sql += ', aadhar_filename=?, aadhar_data=?';
-            values.push(replacementFilename, req.file.buffer);
+            sql += ', aadhar_filename=$9, aadhar_data=$10 WHERE id=$11 AND role=\'student\'';
+            values.push(replacementFilename, req.file.buffer, req.params.id);
+        } else {
+            sql += ' WHERE id=$9 AND role=\'student\'';
+            values.push(req.params.id);
         }
-        sql += " WHERE id=? AND role='student'";
-        values.push(req.params.id);
-        await pool.execute(sql, values);
-        if (replacementFilename) await removeLocalPdf(existingRows[0].aadhar_filename);
+        await pool.query(sql, values);
+        if (replacementFilename) await removeLocalPdf(rows[0].aadhar_filename);
         res.json({ success: true, message: 'Profile updated' });
     } catch (error) {
         await removeLocalPdf(replacementFilename);
@@ -505,8 +451,8 @@ app.put('/api/student/:id', authenticate, requireAccountOrAdmin, upload.single('
 
 async function serveAadhar(req, res, next) {
     try {
-        const [rows] = await pool.execute(
-            "SELECT aadhar_filename, aadhar_data FROM users WHERE id = ? AND role = 'student' LIMIT 1",
+        const { rows } = await pool.query(
+            "SELECT aadhar_filename, aadhar_data FROM users WHERE id=$1 AND role='student' LIMIT 1",
             [req.params.id]
         );
         if (!rows[0] || !rows[0].aadhar_data) return res.status(404).json({ error: 'PDF not found.' });
@@ -528,17 +474,15 @@ app.get('/api/admin/student/:id/aadhar', authenticate, requireAdmin, serveAadhar
 app.post('/api/forgot-password', async (req, res) => {
     const email = String(req.body.email || '').trim().toLowerCase();
     if (!email) return res.status(400).json({ error: 'Email is required.' });
-    if (!mailer && isProduction) {
-        return res.status(503).json({ error: 'Password reset email is not configured.' });
-    }
+    if (!mailer && isProduction) return res.status(503).json({ error: 'Email password reset is not configured yet.' });
     try {
-        const [rows] = await pool.execute('SELECT id FROM users WHERE email = ? LIMIT 1', [email]);
+        const { rows } = await pool.query('SELECT id FROM users WHERE email=$1 LIMIT 1', [email]);
         if (rows[0]) {
             const rawToken = crypto.randomBytes(32).toString('hex');
             const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
-            await pool.execute('DELETE FROM password_reset_tokens WHERE user_id = ?', [rows[0].id]);
-            await pool.execute(
-                'INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES (?, ?, DATE_ADD(UTC_TIMESTAMP(), INTERVAL 30 MINUTE))',
+            await pool.query('DELETE FROM password_reset_tokens WHERE user_id=$1', [rows[0].id]);
+            await pool.query(
+                "INSERT INTO password_reset_tokens (token_hash,user_id,expires_at) VALUES ($1,$2,NOW() + INTERVAL '30 minutes')",
                 [tokenHash, rows[0].id]
             );
             const baseUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
@@ -552,7 +496,6 @@ app.post('/api/forgot-password', async (req, res) => {
                     text: `Use this link within 30 minutes to reset your password: ${resetUrl}`
                 });
             } else {
-                // Local-only convenience; production always requires configured email delivery.
                 return res.json({ success: true, message: 'Password reset link created.', resetUrl: resetUrl.toString() });
             }
         }
@@ -569,46 +512,40 @@ app.post('/api/reset-password', async (req, res) => {
         Buffer.byteLength(newPassword, 'utf8') > 72) {
         return res.status(400).json({ error: 'Use a valid reset link and a password of 10 to 72 UTF-8 bytes.' });
     }
+    const client = await pool.connect();
     try {
         const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-        const connection = await pool.getConnection();
-        try {
-            await connection.beginTransaction();
-            const [rows] = await connection.execute(
-                'SELECT user_id FROM password_reset_tokens WHERE token_hash = ? AND expires_at > UTC_TIMESTAMP() FOR UPDATE',
-                [tokenHash]
-            );
-            if (!rows[0]) {
-                await connection.rollback();
-                return res.status(400).json({ error: 'This reset link is invalid or expired.' });
-            }
-            const passwordHash = await bcrypt.hash(newPassword, 12);
-            await connection.execute(
-                'UPDATE users SET password_hash = ?, auth_version = auth_version + 1 WHERE id = ?',
-                [passwordHash, rows[0].user_id]
-            );
-            await connection.execute('DELETE FROM password_reset_tokens WHERE user_id = ?', [rows[0].user_id]);
-            await connection.commit();
-            clearSessionCookie(res);
-            res.json({ success: true, message: 'Password reset. Please log in with your new password.' });
-        } catch (error) {
-            await connection.rollback();
-            throw error;
-        } finally {
-            connection.release();
+        await client.query('BEGIN');
+        const { rows } = await client.query(
+            'SELECT user_id FROM password_reset_tokens WHERE token_hash=$1 AND expires_at>NOW() FOR UPDATE',
+            [tokenHash]
+        );
+        if (!rows[0]) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'This reset link is invalid or expired.' });
         }
+        const passwordHash = await bcrypt.hash(newPassword, 12);
+        await client.query(
+            'UPDATE users SET password_hash=$1, auth_version=auth_version+1 WHERE id=$2',
+            [passwordHash, rows[0].user_id]
+        );
+        await client.query('DELETE FROM password_reset_tokens WHERE user_id=$1', [rows[0].user_id]);
+        await client.query('COMMIT');
+        clearSessionCookie(res);
+        res.json({ success: true, message: 'Password reset. Please log in with your new password.' });
     } catch (error) {
+        await client.query('ROLLBACK');
         console.error('Could not reset password:', error.message);
         res.status(500).json({ error: 'Could not reset password.' });
+    } finally {
+        client.release();
     }
 });
 
 app.use((err, req, res, next) => {
     if (res.headersSent) return next(err);
     if (err instanceof multer.MulterError) {
-        const message = err.code === 'LIMIT_FILE_SIZE'
-            ? 'PDF must be 3 MB or smaller.'
-            : err.message;
+        const message = err.code === 'LIMIT_FILE_SIZE' ? 'PDF must be 3 MB or smaller.' : err.message;
         return res.status(400).json({ error: message });
     }
     if (err && err.status >= 400 && err.status < 500) {
@@ -621,8 +558,6 @@ app.use((err, req, res, next) => {
     next();
 });
 
-if (require.main === module) {
-    app.listen(PORT, () => console.log(`Server is running on http://localhost:${PORT}`));
-}
+if (require.main === module) app.listen(PORT, () => console.log(`Server is running on http://localhost:${PORT}`));
 
 module.exports = app;
