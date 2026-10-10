@@ -1,7 +1,7 @@
 require('dotenv').config();
 
 const express = require('express');
-const { Pool } = require('@neondatabase/serverless');
+const { neon } = require('@neondatabase/serverless');
 const multer = require('multer');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -38,12 +38,12 @@ if (process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD &&
 }
 if (isProduction && !process.env.APP_URL) throw new Error('Set APP_URL to the deployed HTTPS origin.');
 
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    max: 3,
-    idleTimeoutMillis: 10000,
-    connectionTimeoutMillis: 10000
-});
+const sql = neon(process.env.DATABASE_URL);
+const pool = {
+    async query(text, values = []) {
+        return { rows: await sql.query(text, values) };
+    }
+};
 
 async function initializeDatabase() {
     await pool.query(`CREATE TABLE IF NOT EXISTS users (
@@ -59,7 +59,7 @@ async function initializeDatabase() {
         subject VARCHAR(150),
         marks INTEGER,
         aadhar_filename VARCHAR(100),
-        aadhar_data BYTEA,
+        aadhar_data TEXT,
         role VARCHAR(10) NOT NULL DEFAULT 'student' CHECK (role IN ('admin', 'student')),
         auth_version INTEGER NOT NULL DEFAULT 0,
         created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -70,6 +70,14 @@ async function initializeDatabase() {
         expires_at TIMESTAMPTZ NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
     )`);
+
+    const column = await pool.query(
+        "SELECT data_type FROM information_schema.columns WHERE table_schema='public' AND table_name='users' AND column_name='aadhar_data'"
+    );
+    if (column.rows[0]?.data_type === 'bytea') {
+        await pool.query(`ALTER TABLE users ALTER COLUMN aadhar_data TYPE TEXT
+            USING CASE WHEN aadhar_data IS NULL THEN NULL ELSE encode(aadhar_data, 'base64') END`);
+    }
 
     if (process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD) {
         const email = process.env.ADMIN_EMAIL.trim().toLowerCase();
@@ -310,7 +318,7 @@ app.post('/api/signup', upload.single('aadhar'), async (req, res) => {
              (name, email, password_hash, dob, gender, qualification, interests, class_name, subject, marks, aadhar_filename, aadhar_data)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
              RETURNING id`,
-            [input.values[0], emailAddress, passwordHash, ...input.values.slice(1), savedFilename, req.file.buffer]
+            [input.values[0], emailAddress, passwordHash, ...input.values.slice(1), savedFilename, req.file.buffer.toString('base64')]
         );
         res.status(201).json({ success: true, message: 'Registration successful', userId: rows[0].id });
     } catch (error) {
@@ -451,7 +459,7 @@ app.put('/api/student/:id', authenticate, requireAccountOrAdmin, upload.single('
             replacementFilename = `aadhar-${crypto.randomUUID()}.pdf`;
             await persistLocalPdf(replacementFilename, req.file.buffer);
             sql += ', aadhar_filename=$9, aadhar_data=$10 WHERE id=$11 AND role=\'student\'';
-            values.push(replacementFilename, req.file.buffer, req.params.id);
+            values.push(replacementFilename, req.file.buffer.toString('base64'), req.params.id);
         } else {
             sql += ' WHERE id=$9 AND role=\'student\'';
             values.push(req.params.id);
@@ -479,7 +487,7 @@ async function serveAadhar(req, res, next) {
             'Cache-Control': 'private, no-store',
             'X-Content-Type-Options': 'nosniff'
         });
-        res.send(rows[0].aadhar_data);
+        res.send(Buffer.from(rows[0].aadhar_data, 'base64'));
     } catch (error) {
         next(error);
     }
@@ -513,6 +521,9 @@ app.post('/api/forgot-password', async (req, res) => {
                     text: `Use this link within 30 minutes to reset your password: ${resetUrl}`
                 });
             } else {
+                if (isProduction) {
+                    return res.status(503).json({ error: 'Email password reset is not configured yet.' });
+                }
                 return res.json({ success: true, message: 'Password reset link created.', resetUrl: resetUrl.toString() });
             }
         }
@@ -529,33 +540,28 @@ app.post('/api/reset-password', async (req, res) => {
         Buffer.byteLength(newPassword, 'utf8') > 72) {
         return res.status(400).json({ error: 'Use a valid reset link and a password of 10 to 72 UTF-8 bytes.' });
     }
-    const client = await pool.connect();
     try {
         const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-        await client.query('BEGIN');
-        const { rows } = await client.query(
-            'SELECT user_id FROM password_reset_tokens WHERE token_hash=$1 AND expires_at>NOW() FOR UPDATE',
-            [tokenHash]
-        );
-        if (!rows[0]) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'This reset link is invalid or expired.' });
-        }
         const passwordHash = await bcrypt.hash(newPassword, 12);
-        await client.query(
-            'UPDATE users SET password_hash=$1, auth_version=auth_version+1 WHERE id=$2',
-            [passwordHash, rows[0].user_id]
+        const { rows } = await pool.query(
+            `WITH valid_token AS (
+                DELETE FROM password_reset_tokens
+                WHERE token_hash=$1 AND expires_at>NOW()
+                RETURNING user_id
+            )
+            UPDATE users
+            SET password_hash=$2, auth_version=auth_version+1
+            FROM valid_token
+            WHERE users.id=valid_token.user_id
+            RETURNING users.id`,
+            [tokenHash, passwordHash]
         );
-        await client.query('DELETE FROM password_reset_tokens WHERE user_id=$1', [rows[0].user_id]);
-        await client.query('COMMIT');
+        if (!rows[0]) return res.status(400).json({ error: 'This reset link is invalid or expired.' });
         clearSessionCookie(res);
         res.json({ success: true, message: 'Password reset. Please log in with your new password.' });
     } catch (error) {
-        await client.query('ROLLBACK');
         console.error('Could not reset password:', error.message);
         res.status(500).json({ error: 'Could not reset password.' });
-    } finally {
-        client.release();
     }
 });
 
