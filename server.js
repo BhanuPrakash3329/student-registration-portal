@@ -82,7 +82,12 @@ async function initializeDatabase() {
     }
 }
 
-const databaseReady = initializeDatabase();
+let databaseInitError;
+const databaseReady = initializeDatabase().catch((error) => {
+    databaseInitError = error;
+    console.error('Database initialization failed:', error.code || error.name);
+    throw error;
+});
 databaseReady.catch(() => {});
 
 const upload = multer({
@@ -115,6 +120,18 @@ const mailer = process.env.SMTP_HOST && process.env.SMTP_FROM
 app.use(express.json({ limit: '100kb' }));
 app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 app.use(cookieParser());
+app.get('/api/health', async (req, res) => {
+    try {
+        await databaseReady;
+        res.json({ ok: true, database: 'connected' });
+    } catch (error) {
+        res.status(503).json({
+            ok: false,
+            database: 'unavailable',
+            errorCode: databaseInitError?.code || databaseInitError?.name || 'UNKNOWN'
+        });
+    }
+});
 app.use(async (req, res, next) => {
     try {
         await databaseReady;
