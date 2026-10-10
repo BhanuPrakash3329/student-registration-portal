@@ -2,7 +2,8 @@
   "functions": {
     "server.js": {
       "maxDuration": 30,
-      "includeFiles": "views/**"
+      "includeFiles": "views/**",
+      "regions": ["sin1"]
     }
   }
 }
