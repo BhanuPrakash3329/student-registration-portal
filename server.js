@@ -128,7 +128,11 @@ app.get('/api/health', async (req, res) => {
         res.status(503).json({
             ok: false,
             database: 'unavailable',
-            errorCode: databaseInitError?.code || databaseInitError?.name || 'UNKNOWN'
+            errorCode: databaseInitError?.code || databaseInitError?.name || 'UNKNOWN',
+            errorMessage: String(databaseInitError?.message || error.message)
+                .replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, '[database URL redacted]')
+                .replace(/(password|passwd|pwd)=([^&\s]+)/gi, '$1=[redacted]')
+                .slice(0, 240)
         });
     }
 });
