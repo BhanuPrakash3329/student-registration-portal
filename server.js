@@ -1,7 +1,7 @@
 require('dotenv').config();
 
 const express = require('express');
-const { Pool } = require('pg');
+const { Pool } = require('@neondatabase/serverless');
 const multer = require('multer');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -128,11 +128,7 @@ app.get('/api/health', async (req, res) => {
         res.status(503).json({
             ok: false,
             database: 'unavailable',
-            errorCode: databaseInitError?.code || databaseInitError?.name || 'UNKNOWN',
-            errorMessage: String(databaseInitError?.message || error.message)
-                .replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, '[database URL redacted]')
-                .replace(/(password|passwd|pwd)=([^&\s]+)/gi, '$1=[redacted]')
-                .slice(0, 240)
+            errorCode: databaseInitError?.code || databaseInitError?.name || 'UNKNOWN'
         });
     }
 });
