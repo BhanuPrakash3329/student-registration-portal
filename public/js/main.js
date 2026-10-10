@@ -125,7 +125,7 @@ async function forgotPassword() {
             } else if (result.resetUrl) {
                 prompt('Local development reset link (expires in 30 minutes):', result.resetUrl);
             } else {
-                alert(result.message);
+                alert(result.message || 'If the account exists, password-reset instructions have been sent.');
             }
         } catch (error) {
             alert('Server error.');
@@ -150,9 +150,7 @@ if (resetPasswordForm) {
             message.textContent = result.message || result.error;
             message.className = response.ok ? 'alert alert-success' : 'alert alert-danger';
             message.style.display = 'block';
-            if (response.ok) {
-                setTimeout(() => window.location.href = 'login.html', 1800);
-            }
+            if (response.ok) setTimeout(() => window.location.href = 'login.html', 1800);
         } catch (error) {
             message.textContent = 'Could not reset the password. Please try again.';
             message.className = 'alert alert-danger';

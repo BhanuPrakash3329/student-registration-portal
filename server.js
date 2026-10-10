@@ -36,7 +36,9 @@ if (process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD &&
     process.env.ADMIN_EMAIL.trim().toLowerCase() === 'admin@admin.com') {
     throw new Error('Choose a unique ADMIN_EMAIL; the old demo admin email is blocked.');
 }
-if (isProduction && !process.env.APP_URL) throw new Error('Set APP_URL to the deployed HTTPS origin.');
+if (isProduction && (!process.env.APP_URL || !process.env.ADMIN_EMAIL || !process.env.ADMIN_PASSWORD)) {
+    throw new Error('Set APP_URL and initial admin credentials for production.');
+}
 
 const sql = neon(process.env.DATABASE_URL);
 const pool = {
@@ -337,7 +339,10 @@ app.post('/api/login', async (req, res) => {
             [email]
         );
         const account = rows[0];
-        if (!account || !(await bcrypt.compare(req.body.password || '', account.password_hash))) {
+        const passwordMatches = account
+            ? await bcrypt.compare(req.body.password || '', account.password_hash)
+            : await bcrypt.compare(req.body.password || '', '$2b$12$C6UzMDM.H6dfI/f/IKcEe.0s0t8.5Y8qk6I8mQ1x5Y2vW8mK7m8Xy');
+        if (!account || !passwordMatches) {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
         const token = jwt.sign(
